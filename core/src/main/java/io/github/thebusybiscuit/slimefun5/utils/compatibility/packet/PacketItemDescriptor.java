@@ -1,7 +1,9 @@
 package io.github.thebusybiscuit.slimefun5.utils.compatibility.packet;
 
 import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.UnaryOperator;
@@ -18,6 +20,8 @@ public final class PacketItemDescriptor {
     private static final String[][] FAMILIES = {
         { "net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket" },
         { "net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket" },
+        { "net.minecraft.network.protocol.game.ClientboundSetCursorItemPacket" },
+        { "net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket" },
         // Legacy Spigot NMS lived in net.minecraft.server.<ver>; resolved via the server package below.
         { "PacketPlayOutSetSlot" },
         { "PacketPlayOutWindowItems" },
@@ -25,10 +29,39 @@ public final class PacketItemDescriptor {
 
     private final Class<?> packetClass;
     private final Class<?> nmsItemClass;
+    private final Constructor<?> copyConstructor;
+    private final Method[] copyAccessors;
 
-    private PacketItemDescriptor(Class<?> packetClass, Class<?> nmsItemClass) {
+    PacketItemDescriptor(Class<?> packetClass, Class<?> nmsItemClass) {
         this.packetClass = packetClass;
         this.nmsItemClass = nmsItemClass;
+        Constructor<?> constructor = null;
+        Method[] accessors = null;
+        try {
+            if (recordComponents(packetClass) != null) {
+                Object[] components = recordComponents(packetClass);
+                Class<?>[] types = new Class<?>[components.length];
+                accessors = new Method[components.length];
+                for (int i = 0; i < components.length; i++) {
+                    types[i] = (Class<?>) components[i].getClass().getMethod("getType").invoke(components[i]);
+                    accessors[i] = (Method) components[i].getClass().getMethod("getAccessor").invoke(components[i]);
+                    accessors[i].setAccessible(true);
+                }
+                constructor = packetClass.getDeclaredConstructor(types);
+            } else if (packetClass.getName().equals("net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket")) {
+                // This modern packet is still a normal final-field class. Use its verified
+                // public constructor/accessors, not reflection field order or unsafe writes.
+                constructor = packetClass.getConstructor(int.class, int.class, int.class, nmsItemClass);
+                accessors = new Method[] { packetClass.getMethod("getContainerId"), packetClass.getMethod("getStateId"),
+                    packetClass.getMethod("getSlot"), packetClass.getMethod("getItem") };
+            }
+            if (constructor != null) constructor.setAccessible(true);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            constructor = null;
+            accessors = null;
+        }
+        this.copyConstructor = constructor;
+        this.copyAccessors = accessors;
     }
 
     public static List<PacketItemDescriptor> resolveAll() {
@@ -60,22 +93,28 @@ public final class PacketItemDescriptor {
     /** Rewrites every NMS item the packet carries via {@code itemRewriter}. Never throws. */
     public Object rewrite(Object packet, UnaryOperator<Object> itemRewriter) {
         try {
-            // List payload (WindowItems / SetContent): mutate elements in place.
+            if (copyConstructor != null) {
+                Object[] arguments = new Object[copyAccessors.length];
+                boolean changed = false;
+                for (int i = 0; i < arguments.length; i++) {
+                    Object current = copyAccessors[i].invoke(packet);
+                    arguments[i] = rewriteValue(current, itemRewriter);
+                    changed |= arguments[i] != current;
+                }
+                // Records cannot have their final fields set on Java25. Reconstruct the
+                // complete packet, including carried item and every original sync id.
+                // Neither its list nor the shared canonical server items are modified.
+                return changed ? copyConstructor.newInstance(arguments) : packet;
+            }
+            if (recordComponents(packetClass) != null) return packet; // unsupported record: safe, atomic fallback
+            // Legacy mutable packet payloads. Copy lists before replacing their field:
+            // list.set on an immutable list aborts the carried-item rewrite entirely.
             Field listField = PacketReflect.firstFieldOfType(packet, List.class);
             if (listField != null) {
                 Object listObj = listField.get(packet);
                 if (listObj instanceof List) {
-                    @SuppressWarnings("unchecked")
-                    List<Object> list = (List<Object>) listObj;
-                    for (int i = 0; i < list.size(); i++) {
-                        Object el = list.get(i);
-                        if (nmsItemClass.isInstance(el)) {
-                            Object rewritten = itemRewriter.apply(el);
-                            if (rewritten != null && rewritten != el) {
-                                list.set(i, rewritten);
-                            }
-                        }
-                    }
+                    Object rewritten = rewriteValue(listObj, itemRewriter);
+                    if (rewritten != listObj) trySet(listField, packet, rewritten);
                 }
             }
             // Array payload (early-legacy PacketPlayOutWindowItems carries its contents as an
@@ -113,6 +152,44 @@ public final class PacketItemDescriptor {
             // fall through to returning the original packet (fallback)
         }
         return packet;
+    }
+
+    /** Rewrites a detached value without mutating the source packet/list/array. */
+    private Object rewriteValue(Object current, UnaryOperator<Object> itemRewriter) {
+        if (nmsItemClass.isInstance(current)) {
+            Object replacement = itemRewriter.apply(current);
+            return replacement != null ? replacement : current;
+        }
+        if (current instanceof List<?>) {
+            List<?> list = (List<?>) current;
+            List<Object> copy = new ArrayList<>(list.size());
+            boolean changed = false;
+            for (Object element : list) {
+                Object replacement = nmsItemClass.isInstance(element) ? rewriteValue(element, itemRewriter) : element;
+                copy.add(replacement);
+                changed |= replacement != element;
+            }
+            return changed ? copy : current;
+        }
+        if (current != null && current.getClass().isArray()
+                && nmsItemClass.isAssignableFrom(current.getClass().getComponentType())) {
+            int length = Array.getLength(current);
+            Object copy = Array.newInstance(current.getClass().getComponentType(), length);
+            boolean changed = false;
+            for (int i = 0; i < length; i++) {
+                Object element = Array.get(current, i);
+                Object replacement = rewriteValue(element, itemRewriter);
+                Array.set(copy, i, replacement);
+                changed |= replacement != element;
+            }
+            return changed ? copy : current;
+        }
+        return current;
+    }
+
+    private static Object[] recordComponents(Class<?> type) {
+        try { return (Object[]) Class.class.getMethod("getRecordComponents").invoke(type); }
+        catch (ReflectiveOperationException ignored) { return null; }
     }
 
     private static boolean trySet(Field f, Object owner, Object value) {

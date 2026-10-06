@@ -22,6 +22,7 @@ import io.github.thebusybiscuit.slimefun5.core.guide.options.ItemDescriptionsOpt
 import io.github.thebusybiscuit.slimefun5.implementation.Slimefun;
 import io.github.thebusybiscuit.slimefun5.utils.compatibility.PdcCompat;
 import io.github.thebusybiscuit.slimefun5.utils.compatibility.packet.PacketItemDescriptor;
+import io.github.thebusybiscuit.slimefun5.utils.compatibility.packet.PacketClickDescriptor;
 import io.github.thebusybiscuit.slimefun5.utils.compatibility.packet.PacketReflect;
 import io.github.thebusybiscuit.slimefun5.utils.compatibility.packet.PacketWindowTitleDescriptor;
 
@@ -42,6 +43,9 @@ public class PacketTranslationService implements Listener {
     private static final String NO_LANGUAGE = "";
 
     private final List<PacketItemDescriptor> descriptors;
+    private final PacketClickDescriptor clickDescriptor;
+    private final boolean hashedPredictions;
+    private final Map<UUID, PacketClickDescriptor.Session> clickSessions = new ConcurrentHashMap<>();
 
     /**
      * @implNote Snapshotted once at construction (like descriptors above) rather than re-read per packet:
@@ -116,6 +120,8 @@ public class PacketTranslationService implements Listener {
 
     public PacketTranslationService(@Nonnull Slimefun plugin) {
         this.descriptors = PacketItemDescriptor.resolveAll();
+        this.clickDescriptor = PacketClickDescriptor.resolve();
+        this.hashedPredictions = PacketClickDescriptor.usesHashedPredictions();
         this.fallback = TranslationConfig.fallback();
         this.languageSource = TranslationConfig.languageSource();
         this.windowTitleDescriptor = TranslationConfig.packetsEnabled() ? PacketWindowTitleDescriptor.resolve() : null;
@@ -127,6 +133,9 @@ public class PacketTranslationService implements Listener {
         }
 
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
+        if (hashedPredictions && clickDescriptor == null) {
+            Slimefun.logger().warning("Modern click prediction schema unsupported; packet item rendering disabled to preserve inventory synchronization.");
+        }
         injectAll();
     }
 
@@ -173,6 +182,7 @@ public class PacketTranslationService implements Listener {
         languageCache.remove(e.getPlayer().getUniqueId());
         descriptionsCache.remove(e.getPlayer().getUniqueId());
         pendingWindowTitle.remove(e.getPlayer().getUniqueId());
+        clickSessions.remove(e.getPlayer().getUniqueId());
     }
 
     /**
@@ -231,7 +241,15 @@ public class PacketTranslationService implements Listener {
             if (channel.pipeline().get(HANDLER_NAME) != null) {
                 return; // already injected
             }
+            if (clickDescriptor != null) {
+                clickSessions.put(player.getUniqueId(), clickDescriptor.sessionFor(player));
+            }
             channel.pipeline().addBefore("packet_handler", HANDLER_NAME, new ChannelDuplexHandler() {
+                @Override
+                public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                    PacketClickDescriptor.Session session = clickSessions.get(player.getUniqueId());
+                    super.channelRead(ctx, session != null ? session.rewrite(msg) : msg);
+                }
                 @Override
                 public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
                     Object out = translate(player, msg);
@@ -239,11 +257,12 @@ public class PacketTranslationService implements Listener {
                 }
             });
         } catch (Throwable t) {
-            // "packet_handler" absent or pipeline locked → skip; player sees canonical id (fallback).
+            clickSessions.remove(player.getUniqueId());
+            // Missing pipeline stage or native hash snapshot → skip; canonical items remain intact.
             // Logged (once per join, not spammy) so an operator on a fork with a differently-named
             // pipeline stage has a signal instead of silently losing packet translation.
             Slimefun.logger().info("Could not inject packet translation handler for " + player.getName()
-                + " (pipeline stage \"packet_handler\" missing or locked); items will use their configured fallback.");
+                + " (" + t.getClass().getSimpleName() + "); items will use their configured fallback.");
         }
     }
 
@@ -302,18 +321,22 @@ public class PacketTranslationService implements Listener {
     }
 
     private Object rewriteItem(Object nmsItem, UUID playerId, String language, TranslationConfig.FallbackMode fallback) {
+        // A hashed prediction protocol must never see translated items without an inverse mapping.
+        PacketClickDescriptor.Session session = clickSessions.get(playerId);
+        if (hashedPredictions && session == null) return nmsItem;
         ItemStack bukkit = PacketReflect.asBukkit(nmsItem);
         if (bukkit == null || !bukkit.hasItemMeta()) {
             return nmsItem;
         }
         String id = Slimefun.getItemDataService().getItemData(bukkit).orElse(null);
         if (id == null) {
-            return rewriteGuideBook(nmsItem, bukkit, language); // null id → maybe the guide book
+            Object rendered = rewriteGuideBook(nmsItem, bukkit, language);
+            return session == null || session.observe(nmsItem, rendered) ? rendered : nmsItem;
         }
         boolean includeDescription = !Boolean.FALSE.equals(descriptionsCache.get(playerId)); // default true
         PacketItemRewriter.applyPacketTranslation(bukkit, id, language, fallback, includeDescription);
         Object rewritten = PacketReflect.asNms(bukkit);
-        return rewritten != null ? rewritten : nmsItem;
+        return rewritten != null && (session == null || session.observe(nmsItem, rewritten)) ? rewritten : nmsItem;
     }
 
     private Object rewriteGuideBook(Object nmsItem, ItemStack bukkit, String language) {
